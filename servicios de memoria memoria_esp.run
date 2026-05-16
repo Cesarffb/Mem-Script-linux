@@ -1,0 +1,273 @@
+#!/bin/bash
+# -------------------------------------------------------------------
+# Script .run para instalar/desinstalar servicios de gestión de memoria
+# - Refresh swap basado en % memoria libre o % swap usado (timer)
+# - Limpieza de caché basada en % de buff/cache (demonio)
+# -------------------------------------------------------------------
+
+set -e
+
+GREEN='\033[0;32m'
+RED='\033[0;31m'
+BLUE='\033[0;34m'
+YELLOW='\033[1;33m'
+NC='\033[0m'
+
+# Verificar root
+if [ "$EUID" -ne 0 ]; then
+    echo -e "${RED}Por favor ejecuta como root (usa sudo).${NC}"
+    exit 1
+fi
+
+mostrar_menu() {
+    echo -e "${BLUE}========================================${NC}"
+    echo -e "${GREEN}  INSTALADOR DE SERVICIOS DE MEMORIA${NC}"
+    echo -e "${BLUE}========================================${NC}"
+    echo "1) Instalar servicio de REFRESH SWAP (timer)"
+    echo "2) Instalar servicio de LIMPIEZA DE CACHÉ (monitor continuo)"
+    echo "3) Instalar AMBOS servicios"
+    echo "4) DESINSTALAR servicios"
+    echo "5) Salir"
+    echo -e "${BLUE}========================================${NC}"
+    echo -n "Elige una opción [1-5]: "
+}
+
+explicar_timer() {
+    echo -e "${YELLOW}╔══════════════════════════════════════════════════════════════╗${NC}"
+    echo -e "${YELLOW}║  FORMATO DEL TIMER (OnCalendar) - EJEMPLOS PRÁCTICOS:       ║${NC}"
+    echo -e "${YELLOW}╠══════════════════════════════════════════════════════════════╣${NC}"
+    echo -e "${YELLOW}║  *:0/10      →  Cada 10 minutos (en punto 0,10,20...)      ║${NC}"
+    echo -e "${YELLOW}║  *:0/5       →  Cada 5 minutos                              ║${NC}"
+    echo -e "${YELLOW}║  *:0/30      →  Cada 30 minutos                             ║${NC}"
+    echo -e "${YELLOW}║  hourly      →  Cada hora (en punto)                        ║${NC}"
+    echo -e "${YELLOW}║  daily       →  Cada día a las 00:00                        ║${NC}"
+    echo -e "${YELLOW}║  Mon..Fri 09:00:00 → Lunes a viernes a las 9 AM            ║${NC}"
+    echo -e "${YELLOW}║  *-*-* 02:30:00   →  Todos los días a las 2:30 AM          ║${NC}"
+    echo -e "${YELLOW}╚══════════════════════════════════════════════════════════════╝${NC}"
+    echo ""
+}
+
+instalar_swap() {
+    echo -e "\n${GREEN}>>> Instalando servicio de refresh swap...${NC}"
+    
+    THRESHOLD_MEM=20
+    THRESHOLD_SWAP=20
+    TIMER_FREQUENCY="*:0/10"
+    RANDOMIZED_DELAY_SEC=120
+    
+    read -p "¿Deseas cambiar los umbrales y frecuencia? (s/n): " cambiar
+    if [[ "$cambiar" =~ ^[sS]$ ]]; then
+        read -p "Umbral de memoria libre (%) [20]: " input
+        THRESHOLD_MEM=${input:-20}
+        read -p "Umbral de swap usado (%) [20]: " input
+        THRESHOLD_SWAP=${input:-20}
+        
+        explicar_timer
+        read -p "Frecuencia del timer (ej: *:0/10, hourly, daily): " input
+        TIMER_FREQUENCY=${input:-"*:0/10"}
+        read -p "Retardo aleatorio máximo (segundos) [120]: " input
+        RANDOMIZED_DELAY_SEC=${input:-120}
+    fi
+    
+    SCRIPT_PATH="/usr/local/bin/refresh_swap.sh"
+    cat > "$SCRIPT_PATH" << EOF
+#!/bin/bash
+THRESHOLD_MEM=$THRESHOLD_MEM
+THRESHOLD_SWAP=$THRESHOLD_SWAP
+
+read mem_total mem_available <<< \$(free -k | awk '/^Mem:/ {print \$2, \$7}')
+mem_percent=\$((100 * mem_available / mem_total))
+
+read swap_total swap_used <<< \$(free -k | awk '/^Swap:/ {print \$2, \$3}')
+if [ \$swap_total -gt 0 ]; then
+    swap_percent=\$((100 * swap_used / swap_total))
+else
+    swap_percent=0
+fi
+
+logger -t refresh-swap "Memoria libre: \${mem_percent}% | Swap usado: \${swap_percent}%"
+
+if [ \$mem_percent -ge \$THRESHOLD_MEM ] || [ \$swap_percent -gt \$THRESHOLD_SWAP ]; then
+    logger -t refresh-swap "Condición cumplida. Reiniciando swap..."
+    /sbin/swapoff -a
+    /sbin/swapon -a
+    logger -t refresh-swap "Swap reiniciado correctamente."
+else
+    logger -t refresh-swap "Condición no cumplida. No se hace nada."
+fi
+EOF
+    chmod +x "$SCRIPT_PATH"
+    
+    SERVICE_FILE="/etc/systemd/system/refresh-swap.service"
+    cat > "$SERVICE_FILE" << EOF
+[Unit]
+Description=Refresh swap if memory free >= ${THRESHOLD_MEM}% or swap used > ${THRESHOLD_SWAP}%
+
+[Service]
+Type=oneshot
+ExecStart=$SCRIPT_PATH
+User=root
+StandardOutput=journal
+StandardError=journal
+EOF
+
+    TIMER_FILE="/etc/systemd/system/refresh-swap.timer"
+    cat > "$TIMER_FILE" << EOF
+[Unit]
+Description=Timer para refresh-swap
+
+[Timer]
+OnCalendar=$TIMER_FREQUENCY
+RandomizedDelaySec=$RANDOMIZED_DELAY_SEC
+Persistent=true
+
+[Install]
+WantedBy=timers.target
+EOF
+
+    systemctl daemon-reload
+    systemctl enable refresh-swap.timer
+    systemctl start refresh-swap.timer
+    
+    echo -e "${GREEN}✓ Servicio refresh-swap instalado y activado.${NC}"
+    echo "  - Frecuencia: $TIMER_FREQUENCY"
+    echo "  - Ver logs: journalctl -u refresh-swap.service -f"
+}
+
+instalar_cache() {
+    echo -e "\n${GREEN}>>> Instalando servicio de limpieza de caché...${NC}"
+    
+    UMBRAL_CACHE=40
+    CHECK_INTERVAL=30
+    DROP_CACHE_LEVEL=3
+    
+    read -p "¿Deseas cambiar los parámetros de limpieza de caché? (s/n): " cambiar
+    if [[ "$cambiar" =~ ^[sS]$ ]]; then
+        read -p "Umbral de buff/cache (%) que dispara la limpieza [40]: " input
+        UMBRAL_CACHE=${input:-40}
+        read -p "Intervalo de comprobación (segundos) [30]: " input
+        CHECK_INTERVAL=${input:-30}
+        read -p "Nivel de drop_caches (1=pagecache, 2=dentries, 3=ambos) [3]: " input
+        DROP_CACHE_LEVEL=${input:-3}
+    fi
+    
+    SCRIPT_PATH="/usr/local/bin/cache_percent_monitor.sh"
+    cat > "$SCRIPT_PATH" << EOF
+#!/bin/bash
+UMBRAL=$UMBRAL_CACHE
+INTERVALO=$CHECK_INTERVAL
+NIVEL=$DROP_CACHE_LEVEL
+
+while true; do
+    read mem_total mem_buffcache <<< \$(free -k | awk '/^Mem:/ {print \$2, \$6}')
+    cache_percent=\$((100 * mem_buffcache / mem_total))
+    
+    if [ \$cache_percent -gt \$UMBRAL ]; then
+        logger -t cache-percent-monitor "Caché: \${cache_percent}% (supera umbral \${UMBRAL}%). Limpiando..."
+        sync
+        echo \$NIVEL > /proc/sys/vm/drop_caches
+        logger -t cache-percent-monitor "Caché limpiada (nivel \$NIVEL)"
+    else
+        logger -t cache-percent-monitor "Caché: \${cache_percent}% (dentro del límite)"
+    fi
+    sleep \$INTERVALO
+done
+EOF
+    chmod +x "$SCRIPT_PATH"
+    
+    SERVICE_FILE="/etc/systemd/system/cache-percent-monitor.service"
+    cat > "$SERVICE_FILE" << EOF
+[Unit]
+Description=Monitor de caché (buff/cache) - limpia si > ${UMBRAL_CACHE}%
+After=network.target
+
+[Service]
+Type=simple
+ExecStart=$SCRIPT_PATH
+Restart=always
+RestartSec=10
+User=root
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=multi-user.target
+EOF
+
+    systemctl daemon-reload
+    systemctl enable cache-percent-monitor.service
+    systemctl start cache-percent-monitor.service
+    
+    echo -e "${GREEN}✓ Servicio cache-percent-monitor instalado y activado.${NC}"
+    echo "  - Umbral: ${UMBRAL_CACHE}%, comprobación cada ${CHECK_INTERVAL}s"
+    echo "  - Ver logs: journalctl -u cache-percent-monitor.service -f"
+}
+
+desinstalar() {
+    echo -e "\n${RED}>>> DESINSTALACIÓN DE SERVICIOS${NC}"
+    echo "¿Qué quieres desinstalar?"
+    echo "1) Solo el servicio de swap (refresh-swap)"
+    echo "2) Solo el servicio de caché (cache-percent-monitor)"
+    echo "3) Ambos"
+    echo -n "Elige [1-3]: "
+    read opcion_des
+    
+    case $opcion_des in
+        1)
+            echo "Deteniendo y deshabilitando refresh-swap.timer..."
+            systemctl stop refresh-swap.timer 2>/dev/null || true
+            systemctl disable refresh-swap.timer 2>/dev/null || true
+            systemctl stop refresh-swap.service 2>/dev/null || true
+            rm -f /etc/systemd/system/refresh-swap.timer
+            rm -f /etc/systemd/system/refresh-swap.service
+            rm -f /usr/local/bin/refresh_swap.sh
+            echo -e "${GREEN}✓ Servicio swap desinstalado.${NC}"
+            ;;
+        2)
+            echo "Deteniendo y deshabilitando cache-percent-monitor..."
+            systemctl stop cache-percent-monitor.service 2>/dev/null || true
+            systemctl disable cache-percent-monitor.service 2>/dev/null || true
+            rm -f /etc/systemd/system/cache-percent-monitor.service
+            rm -f /usr/local/bin/cache_percent_monitor.sh
+            echo -e "${GREEN}✓ Servicio caché desinstalado.${NC}"
+            ;;
+        3)
+            echo "Desinstalando ambos..."
+            systemctl stop refresh-swap.timer 2>/dev/null || true
+            systemctl disable refresh-swap.timer 2>/dev/null || true
+            systemctl stop refresh-swap.service 2>/dev/null || true
+            rm -f /etc/systemd/system/refresh-swap.timer
+            rm -f /etc/systemd/system/refresh-swap.service
+            rm -f /usr/local/bin/refresh_swap.sh
+            
+            systemctl stop cache-percent-monitor.service 2>/dev/null || true
+            systemctl disable cache-percent-monitor.service 2>/dev/null || true
+            rm -f /etc/systemd/system/cache-percent-monitor.service
+            rm -f /usr/local/bin/cache_percent_monitor.sh
+            echo -e "${GREEN}✓ Ambos servicios desinstalados.${NC}"
+            ;;
+        *)
+            echo -e "${RED}Opción no válida. Volviendo al menú principal.${NC}"
+            return
+            ;;
+    esac
+    
+    systemctl daemon-reload
+    echo -e "${YELLOW}Nota: Los logs antiguos permanecen en journalctl. Puedes limpiarlos con 'journalctl --rotate' si lo deseas.${NC}"
+}
+
+# Bucle principal
+while true; do
+    mostrar_menu
+    read opcion
+    case $opcion in
+        1) instalar_swap ;;
+        2) instalar_cache ;;
+        3) instalar_swap; instalar_cache ;;
+        4) desinstalar ;;
+        5) echo -e "${GREEN}Saliendo...${NC}"; exit 0 ;;
+        *) echo -e "${RED}Opción no válida.${NC}" ;;
+    esac
+    echo ""
+    read -p "Presiona Enter para continuar..."
+done

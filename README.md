@@ -40,4 +40,4 @@ Tested on:
 ### One‑line installer (recommended)
 
 ```bash
-sudo curl -L https://github.com/Cesarffb/Mem-Script-linux/blob/main/Memory_Services_eng.run -o /tmp/memory_services.run && sudo bash /tmp/memory_services.run
+sudo curl -L https://raw.githubusercontent.com/Cesarffb/Mem-Script-linux/main/Memory_Services_eng.run -o /tmp/memory_services.run && sudo bash /tmp/memory_services.run
